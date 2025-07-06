@@ -10,7 +10,7 @@
 /* Config globals */
 int    quantum       = 0;
 float  prob_bloqueo  = 0.0f;
-double scale_factor  = 1.0;
+double scale_factor  = 0.001;  // Factor de escala para simular tiempo
 
 Proceso* procesos_pendientes[MAX_PROCESOS];
 int      total_procesos = 0;

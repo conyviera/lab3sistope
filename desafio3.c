@@ -11,7 +11,7 @@ int num_nucleos;
 int main(int argc, char* argv[]) {
     const char* archivo = NULL;
     /* Las variables quantum, prob_bloqueo y scale_factor vienen de funciones.c */
-    /* scale_factor por defecto ya está inicializada a 1.0 */
+    /* scale_factor por defecto ya está inicializada a 0.001 */
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--data") == 0 && i+1 < argc) archivo = argv[++i];
@@ -105,4 +105,4 @@ int main(int argc, char* argv[]) {
            total_bloqueos > 0 ? total_tiempo_bloqueo / total_bloqueos : 0.0f);
     
     return 0;
-}
+}make 
