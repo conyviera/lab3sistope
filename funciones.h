@@ -23,6 +23,8 @@ typedef struct {
 void cargarProcesos(const char* archivo);
 void* planificador(void* arg);
 void* manejador_bloqueos(void* arg);
+void* hilo_reloj(void* arg);
+
 
 
 #endif

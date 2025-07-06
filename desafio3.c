@@ -6,6 +6,8 @@
 #include "funciones.h"
 
 int num_nucleos;
+pthread_t hilo_ingresador;
+
 
 int main(int argc, char* argv[]) {
     const char* archivo = NULL;
@@ -36,13 +38,19 @@ int main(int argc, char* argv[]) {
         pthread_create(&hilos[i], NULL, planificador, &estadisticas[i]);
     }
 
+    pthread_create(&hilo_ingresador, NULL, hilo_reloj, NULL);
+
+
     pthread_t hilo_bloqueador;
     pthread_create(&hilo_bloqueador, NULL, manejador_bloqueos, NULL);
 
-    for (int i = 0; i < num_nucleos; i++)
-        pthread_join(hilos[i], NULL);
+    for (int i = 0; i < num_nucleos; i++) {
+    pthread_join(hilos[i], NULL);
+    }
 
-    pthread_cancel(hilo_bloqueador);
+    pthread_join(hilo_ingresador, NULL);       // si agregaste el hilo reloj
+    pthread_cancel(hilo_bloqueador);           // opcional pero recomendable
+    pthread_join(hilo_bloqueador, NULL);       // espera que termine
 
     for (int i = 0; i < num_nucleos; i++) {
         Estadisticas e = estadisticas[i];
@@ -52,4 +60,5 @@ int main(int argc, char* argv[]) {
     }
 
     return 0;
+
 }
