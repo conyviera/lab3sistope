@@ -42,6 +42,11 @@ static inline void incrementar_tiempo(int ms) {
     pthread_mutex_unlock(&mutex_tiempo);
 }
 
+/* Función para obtener tiempo total de simulación */
+int obtener_tiempo_simulacion_total(void) {
+    return obtener_tiempo_actual();
+}
+
 /* Carga procesos admitiendo llegadas con decimales */
 void cargarProcesos(const char* archivo) {
     FILE* f = fopen(archivo, "r");
@@ -64,6 +69,10 @@ void cargarProcesos(const char* archivo) {
         p->veces_bloqueado  = 0;
         p->tiempo_total_espera   = 0;
         p->tiempo_total_bloqueo  = 0;
+        /* Inicializar nuevos campos */
+        p->tiempo_espera_inicial    = 0;
+        p->tiempo_espera_reencolado = 0;
+        p->ya_tuvo_primer_bloqueo   = 0;
         procesos_pendientes[total_procesos++] = p;
         printf("[LOAD] PID=%d llegada=%.2f→%d servicio=%d\n",
                pid, llegada_f, p->tiempo_llegada, servicio);
@@ -71,7 +80,7 @@ void cargarProcesos(const char* archivo) {
     fclose(f);
 }
 
-/* Planificador Round Robin, acumula toda la espera */
+/* Planificador Round Robin con métricas separadas */
 void* planificador(void* arg) {
     Estadisticas* est = arg;
     while (__sync_fetch_and_add(&procesos_terminados, 0) < total_procesos) {
@@ -87,12 +96,25 @@ void* planificador(void* arg) {
         pthread_mutex_unlock(&mutex_runqueue);
 
         int ahora = obtener_tiempo_actual();
+        
         /* Medir tiempo de espera desde última encolada */
         if (p->tiempo_entrada_runqueue >= 0) {
             int espera = ahora - p->tiempo_entrada_runqueue;
             p->tiempo_total_espera += espera;
+            
+            /* Separar espera inicial vs reencolado */
             pthread_mutex_lock(&mutex_stats);
-            est->tiempo_espera_total += espera;
+            if (!p->fue_ejecutado) {
+                /* Primera ejecución: espera inicial */
+                p->tiempo_espera_inicial = espera;
+                est->tiempo_espera_inicial_total += espera;
+                p->tiempo_primera_ejecucion = ahora;
+                p->fue_ejecutado = 1;
+            } else {
+                /* Reencolado: espera posterior */
+                p->tiempo_espera_reencolado += espera;
+                est->tiempo_espera_reencolado_total += espera;
+            }
             pthread_mutex_unlock(&mutex_stats);
         }
 
@@ -117,12 +139,16 @@ void* planificador(void* arg) {
         est->tiempo_utilizado += uso;
 
         if (bloquea && p->tiempo_restante > 0) {
-            /* Evento de bloqueo: contar solo una vez */
+            /* Evento de bloqueo: contar solo el primer bloqueo por proceso */
             p->esta_bloqueado = 1;
             p->veces_bloqueado++;
-            pthread_mutex_lock(&mutex_stats);
-            est->bloqueos_count++;
-            pthread_mutex_unlock(&mutex_stats);
+            
+            if (!p->ya_tuvo_primer_bloqueo) {
+                p->ya_tuvo_primer_bloqueo = 1;
+                pthread_mutex_lock(&mutex_stats);
+                est->bloqueos_count++;
+                pthread_mutex_unlock(&mutex_stats);
+            }
 
             pthread_mutex_lock(&mutex_bloqueados);
             bloqueados[bloqueados_size++] = (ProcesoBloqueado){
@@ -188,7 +214,6 @@ void* manejador_bloqueos(void* arg) {
     }
     return NULL;
 }
-
 
 /* Hilo reloj que avanza 10ms simulados */
 void* hilo_reloj(void* arg) {

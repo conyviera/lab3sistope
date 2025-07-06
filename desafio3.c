@@ -41,9 +41,10 @@ int main(int argc, char* argv[]) {
         estad[i].id = i;
         estad[i].procesos_ejecutados = 0;
         estad[i].tiempo_utilizado    = 0;
-        estad[i].tiempo_espera_total = 0;
-        estad[i].tiempo_bloqueo_total= 0;
-        estad[i].bloqueos_count      = 0;
+        estad[i].tiempo_espera_inicial_total    = 0;
+        estad[i].tiempo_espera_reencolado_total = 0;
+        estad[i].tiempo_bloqueo_total = 0;
+        estad[i].bloqueos_count       = 0;
         pthread_create(&hilos[i], NULL, planificador, &estad[i]);
     }
     pthread_t r, b;
@@ -54,16 +55,54 @@ int main(int argc, char* argv[]) {
     pthread_join(r, NULL);
     pthread_join(b, NULL);
 
+    /* Obtener tiempo total de simulación */
+    int tiempo_total = obtener_tiempo_simulacion_total();
+    
     printf("\n=== ESTADÍSTICAS ===\n");
+    printf("Tiempo total de simulación: %d ms\n\n", tiempo_total);
+    
+    /* Estadísticas por CPU */
+    int total_tiempo_utilizado = 0;
+    int total_procesos = 0;
+    int total_bloqueos = 0;
+    float total_espera_inicial = 0;
+    float total_espera_reencolado = 0;
+    float total_tiempo_bloqueo = 0;
+    
     for (int i = 0; i < num_nucleos; i++) {
         Estadisticas* e = &estad[i];
-        printf("CPU %d: proc=%d CPU=%dms esp=%.2fms blk=%.2fms(%d)\n",
+        float utilizacion = tiempo_total > 0 ? 100.0f * e->tiempo_utilizado / tiempo_total : 0.0f;
+        
+        printf("CPU %d: proc=%d CPU=%dms (%.1f%%) esp_ini=%.2fms esp_reen=%.2fms blk=%.2fms(%d)\n",
                e->id,
                e->procesos_ejecutados,
                e->tiempo_utilizado,
-               e->procesos_ejecutados? (float)e->tiempo_espera_total/e->procesos_ejecutados : 0.0f,
-               e->bloqueos_count? (float)e->tiempo_bloqueo_total/e->bloqueos_count : 0.0f,
+               utilizacion,
+               e->procesos_ejecutados > 0 ? (float)e->tiempo_espera_inicial_total / e->procesos_ejecutados : 0.0f,
+               e->procesos_ejecutados > 0 ? (float)e->tiempo_espera_reencolado_total / e->procesos_ejecutados : 0.0f,
+               e->bloqueos_count > 0 ? (float)e->tiempo_bloqueo_total / e->bloqueos_count : 0.0f,
                e->bloqueos_count);
+        
+        total_tiempo_utilizado += e->tiempo_utilizado;
+        total_procesos += e->procesos_ejecutados;
+        total_bloqueos += e->bloqueos_count;
+        total_espera_inicial += e->tiempo_espera_inicial_total;
+        total_espera_reencolado += e->tiempo_espera_reencolado_total;
+        total_tiempo_bloqueo += e->tiempo_bloqueo_total;
     }
+    
+    /* Estadísticas globales */
+    printf("\n=== RESUMEN GLOBAL ===\n");
+    printf("Utilización total del sistema: %.1f%%\n", 
+           tiempo_total > 0 ? 100.0f * total_tiempo_utilizado / (tiempo_total * num_nucleos) : 0.0f);
+    printf("Procesos ejecutados: %d\n", total_procesos);
+    printf("Procesos únicos bloqueados: %d\n", total_bloqueos);
+    printf("Espera inicial promedio: %.2f ms\n", 
+           total_procesos > 0 ? total_espera_inicial / total_procesos : 0.0f);
+    printf("Espera reencolado promedio: %.2f ms\n", 
+           total_procesos > 0 ? total_espera_reencolado / total_procesos : 0.0f);
+    printf("Tiempo bloqueo promedio: %.2f ms\n", 
+           total_bloqueos > 0 ? total_tiempo_bloqueo / total_bloqueos : 0.0f);
+    
     return 0;
 }
