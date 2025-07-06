@@ -1,13 +1,15 @@
+/* --- funciones.h --- */
 #ifndef FUNCIONES_H
 #define FUNCIONES_H
 
 #include <pthread.h>
 
-// Variables globales de configuración
-extern int quantum;
-extern float prob_bloqueo;
+/* Variables de configuración (definidas en funciones.c) */
+extern int    quantum;
+extern float  prob_bloqueo;
+extern double scale_factor;
 
-// Estructura optimizada para procesos
+/* Estructura de un proceso */
 typedef struct {
     int pid;
     int tiempo_servicio;
@@ -18,14 +20,19 @@ typedef struct {
     int tiempo_primera_ejecucion;
     int fue_ejecutado;
     int last_core;
-    
-    // Nuevos campos para mejores estadísticas
+    int veces_bloqueado;
     int tiempo_total_espera;
     int tiempo_total_bloqueo;
-    int veces_bloqueado;
 } Proceso;
 
-// Estructura optimizada para estadísticas
+/* Nodo para procesos bloqueados */
+typedef struct {
+    Proceso* proceso;
+    int      tiempo_bloqueo_restante;
+    int      tiempo_inicio_bloqueo;
+} ProcesoBloqueado;
+
+/* Estadísticas por núcleo */
 typedef struct {
     int id;
     int procesos_ejecutados;
@@ -33,16 +40,13 @@ typedef struct {
     int tiempo_espera_total;
     int tiempo_bloqueo_total;
     int bloqueos_count;
-    
-    // Nuevos campos para análisis de rendimiento
-    int procesos_completados;
-    int tiempo_inactivo;
 } Estadisticas;
 
-// Declaraciones de funciones
+/* Prototipos */
 void cargarProcesos(const char* archivo);
 void* planificador(void* arg);
 void* manejador_bloqueos(void* arg);
 void* hilo_reloj(void* arg);
 
-#endif
+#endif /* FUNCIONES_H */
+

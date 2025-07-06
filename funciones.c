@@ -1,323 +1,211 @@
 /* --- funciones.c --- */
+#define _POSIX_C_SOURCE 200809L
+#include <unistd.h>     /* usleep() */
+#include "funciones.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <unistd.h>
-#include <time.h>
-#include "funciones.h"
 
 #define MAX_PROCESOS 1000
 
-// Estructuras de datos globales
+/* Definición única de las variables globales */
+int    quantum       = 0;
+float  prob_bloqueo  = 0.0f;
+double scale_factor  = 1.0;
+
 Proceso* procesos_pendientes[MAX_PROCESOS];
-int total_procesos = 0;
+int      total_procesos = 0;
 
 Proceso* runqueue[MAX_PROCESOS];
-int runqueue_size = 0;
+int      runqueue_size  = 0;
 
-int procesos_terminados = 0;
-int tiempo_actual = 0;
-
-// Estructura mejorada para procesos bloqueados con tiempo de bloqueo
-typedef struct {
-    Proceso* proceso;
-    int tiempo_bloqueo_restante;
-    int tiempo_inicio_bloqueo;
-} ProcesoBloqueado;
+volatile int procesos_terminados = 0;
+static int    tiempo_actual      = 0;
 
 ProcesoBloqueado bloqueados[MAX_PROCESOS];
-int bloqueados_size = 0;
+int              bloqueados_size = 0;
 
-// Mutex para sincronización
-pthread_mutex_t mutex_runqueue = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutex_bloqueados = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutex_stats = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutex_tiempo = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mutex_runqueue   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mutex_bloqueados = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mutex_stats      = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mutex_tiempo     = PTHREAD_MUTEX_INITIALIZER;
 
-// Variables de configuración
-int quantum = 0;
-float prob_bloqueo = 0;
-
-// Funciones auxiliares optimizadas
-static inline int obtener_tiempo_actual() {
+/* Auxiliares de tiempo simulado */
+static inline int obtener_tiempo_actual(void) {
     pthread_mutex_lock(&mutex_tiempo);
     int t = tiempo_actual;
     pthread_mutex_unlock(&mutex_tiempo);
     return t;
 }
-
-static inline void incrementar_tiempo(int incremento) {
+static inline void incrementar_tiempo(int ms) {
     pthread_mutex_lock(&mutex_tiempo);
-    tiempo_actual += incremento;
+    tiempo_actual += ms;
     pthread_mutex_unlock(&mutex_tiempo);
 }
 
-/**
- * Entradas: archivo - nombre del archivo con los procesos
- * Salidas: ninguna
- * Descripción: Carga los procesos desde archivo y los almacena en memoria
- */
 void cargarProcesos(const char* archivo) {
     FILE* f = fopen(archivo, "r");
     if (!f) {
-        perror("Error al abrir el archivo");
+        perror("Error al abrir archivo");
         exit(EXIT_FAILURE);
     }
 
-    int pid = 0;
-    int tiempo_llegada, tiempo_servicio;
-    
-    while (fscanf(f, "%d %d %d", &pid, &tiempo_llegada, &tiempo_servicio) == 3) {
-        if (total_procesos >= MAX_PROCESOS) {
-            fprintf(stderr, "Error: Demasiados procesos\n");
-            break;
-        }
-        
-        Proceso* p = malloc(sizeof(Proceso));
+    int pid, servicio;
+    double llegada_f;
+    /* leer PID, llegada (float), servicio */
+    while (total_procesos < MAX_PROCESOS &&
+           fscanf(f, "%d %lf %d", &pid, &llegada_f, &servicio) == 3) {
+        Proceso* p = malloc(sizeof *p);
         if (!p) {
-            perror("Error al asignar memoria");
+            perror("malloc");
             exit(EXIT_FAILURE);
         }
-        
-        p->pid = pid;
-        p->tiempo_llegada = tiempo_llegada;
-        p->tiempo_servicio = tiempo_servicio;
-        p->tiempo_restante = tiempo_servicio;
-        p->esta_bloqueado = 0;
-        p->tiempo_entrada_runqueue = -1;
-        p->tiempo_primera_ejecucion = -1;
-        p->fue_ejecutado = 0;
-        p->last_core = -1;
-        p->tiempo_total_espera = 0;
-        p->tiempo_total_bloqueo = 0;
-        p->veces_bloqueado = 0;
+
+        p->pid              = pid;
+        /* redondeo manual: +0.5 y cast a int */
+        p->tiempo_llegada   = (int)(llegada_f + 0.5);
+        p->tiempo_servicio  = servicio;
+        p->tiempo_restante  = servicio;
+        p->esta_bloqueado   = 0;
+        p->tiempo_entrada_runqueue   = -1;
+        p->tiempo_primera_ejecucion  = -1;
+        p->fue_ejecutado     = 0;
+        p->last_core         = -1;
+        p->veces_bloqueado   = 0;
+        p->tiempo_total_espera   = 0;
+        p->tiempo_total_bloqueo  = 0;
 
         procesos_pendientes[total_procesos++] = p;
-        printf("[LOAD] Proceso PID %d, llegada %d, servicio %d\n", 
-               p->pid, p->tiempo_llegada, p->tiempo_servicio);
+        printf("[LOAD] PID=%d llegada=%.2f→%d servicio=%d\n",
+               pid, llegada_f, p->tiempo_llegada, servicio);
     }
+
     fclose(f);
 }
 
-/**
- * Entradas: arg - puntero a estructura Estadisticas
- * Salidas: NULL
- * Descripción: Función principal del planificador que ejecuta procesos
- */
+/* Planificador Round Robin */
 void* planificador(void* arg) {
-    Estadisticas* est = (Estadisticas*)arg;
-    
+    Estadisticas* est = arg;
     while (__sync_fetch_and_add(&procesos_terminados, 0) < total_procesos) {
-        
-        // Obtener proceso de la runqueue
         pthread_mutex_lock(&mutex_runqueue);
-        if (runqueue_size == 0) {
+        if (!runqueue_size) {
             pthread_mutex_unlock(&mutex_runqueue);
-            usleep(1000); // Esperar 1ms si no hay procesos
+            usleep((unsigned)(1 * 1000 * scale_factor));
             continue;
         }
-        
         Proceso* p = runqueue[0];
-        // Remover proceso de la runqueue (FIFO)
-        for (int j = 0; j < runqueue_size - 1; j++) {
-            runqueue[j] = runqueue[j + 1];
-        }
+        for (int i = 1; i < runqueue_size; i++) runqueue[i-1] = runqueue[i];
         runqueue_size--;
         pthread_mutex_unlock(&mutex_runqueue);
-        
-        // Actualizar estadísticas
+
+        int ahora = obtener_tiempo_actual();
+        if (!p->fue_ejecutado) {
+            p->fue_ejecutado = 1;
+            p->tiempo_primera_ejecucion = ahora;
+            if (p->tiempo_entrada_runqueue >= 0) {
+                int esp = ahora - p->tiempo_entrada_runqueue;
+                p->tiempo_total_espera += esp;
+                est->tiempo_espera_total += esp;
+            }
+        }
         est->procesos_ejecutados++;
         p->last_core = est->id;
-        
-        int tiempo_inicio_ejecucion = obtener_tiempo_actual();
-        
-        // Calcular tiempo de espera si es la primera ejecución
-        if (!p->fue_ejecutado) {
-            p->tiempo_primera_ejecucion = tiempo_inicio_ejecucion;
-            p->fue_ejecutado = 1;
-            if (p->tiempo_entrada_runqueue >= 0) {
-                int tiempo_espera = p->tiempo_primera_ejecucion - p->tiempo_entrada_runqueue;
-                p->tiempo_total_espera += tiempo_espera;
-                est->tiempo_espera_total += tiempo_espera;
-            }
+
+        int bloquea = ((float)rand()/RAND_MAX) < prob_bloqueo;
+        int uso = p->tiempo_restante < quantum ? p->tiempo_restante : quantum;
+        if (bloquea) {
+            int antes = rand() % (quantum+1);
+            if (antes > p->tiempo_restante) antes = p->tiempo_restante;
+            uso = antes;
         }
-        
-        printf("[CPU %d] Ejecutando PID %d, restante %d ms\n", 
-               est->id, p->pid, p->tiempo_restante);
-        
-        // Determinar si el proceso se bloquea
-        int se_bloquea = ((float)rand() / RAND_MAX) < prob_bloqueo;
-        
-        if (!se_bloquea) {
-            // Ejecución normal sin bloqueo
-            int tiempo_ejecucion = (p->tiempo_restante > quantum) ? quantum : p->tiempo_restante;
-            
-            printf("[CPU %d] PID %d ejecutando %d ms sin bloqueo\n", 
-                   est->id, p->pid, tiempo_ejecucion);
-            
-            // Simular ejecución (sin dormir tanto tiempo real)
-            usleep(tiempo_ejecucion * 10); // Reducir el tiempo real de simulación
-            
-            // Actualizar tiempos
-            p->tiempo_restante -= tiempo_ejecucion;
-            est->tiempo_utilizado += tiempo_ejecucion;
-            incrementar_tiempo(tiempo_ejecucion);
-            
-        } else {
-            // El proceso se bloquea durante la ráfaga
-            int tiempo_antes_bloqueo = rand() % (quantum + 1);
-            if (tiempo_antes_bloqueo > p->tiempo_restante) {
-                tiempo_antes_bloqueo = p->tiempo_restante;
-            }
-            
-            printf("[CPU %d] PID %d se bloquea después de %d ms\n", 
-                   est->id, p->pid, tiempo_antes_bloqueo);
-            
-            // Simular ejecución antes del bloqueo
-            if (tiempo_antes_bloqueo > 0) {
-                usleep(tiempo_antes_bloqueo * 10); // Reducir tiempo real
-                p->tiempo_restante -= tiempo_antes_bloqueo;
-                est->tiempo_utilizado += tiempo_antes_bloqueo;
-                incrementar_tiempo(tiempo_antes_bloqueo);
-            }
-            
-            // Si el proceso terminó antes del bloqueo
-            if (p->tiempo_restante <= 0) {
-                printf("[CPU %d] PID %d terminó antes del bloqueo\n", est->id, p->pid);
-                __sync_fetch_and_add(&procesos_terminados, 1);
-                free(p);
-                continue;
-            }
-            
-            // Agregar a cola de bloqueados
+        printf("[CPU %d|t=%d] PID=%d usa %d ms%s\n",
+               est->id, ahora, p->pid, uso,
+               bloquea ? " (bloquea)" : "");
+
+        usleep((unsigned)(uso * 1000 * scale_factor));
+        incrementar_tiempo(uso);
+        p->tiempo_restante -= uso;
+        est->tiempo_utilizado += uso;
+
+        if (bloquea && p->tiempo_restante > 0) {
             p->esta_bloqueado = 1;
             p->veces_bloqueado++;
-            
             pthread_mutex_lock(&mutex_bloqueados);
-            bloqueados[bloqueados_size].proceso = p;
-            bloqueados[bloqueados_size].tiempo_bloqueo_restante = 100 + rand() % 401; // 100-500ms
-            bloqueados[bloqueados_size].tiempo_inicio_bloqueo = obtener_tiempo_actual();
-            bloqueados_size++;
+            bloqueados[bloqueados_size++] = (ProcesoBloqueado){
+                .proceso = p,
+                .tiempo_bloqueo_restante = 100 + rand()%401,
+                .tiempo_inicio_bloqueo = obtener_tiempo_actual()
+            };
             pthread_mutex_unlock(&mutex_bloqueados);
-            
             continue;
         }
-        
-        // Verificar si el proceso terminó
         if (p->tiempo_restante <= 0) {
-            printf("[CPU %d] PID %d terminado\n", est->id, p->pid);
-            __sync_fetch_and_add(&procesos_terminados, 1);
+            printf("[CPU %d|t=%d] PID=%d terminado\n",
+                   est->id, obtener_tiempo_actual(), p->pid);
+            __sync_add_and_fetch(&procesos_terminados, 1);
             free(p);
         } else {
-            // Devolver proceso a la runqueue
-            printf("[CPU %d] PID %d devuelto a runqueue con %d ms restantes\n", 
-                   est->id, p->pid, p->tiempo_restante);
-            
             pthread_mutex_lock(&mutex_runqueue);
             p->tiempo_entrada_runqueue = obtener_tiempo_actual();
             runqueue[runqueue_size++] = p;
             pthread_mutex_unlock(&mutex_runqueue);
         }
     }
-    
-    pthread_exit(NULL);
+    return NULL;
 }
 
-/**
- * Entradas: arg - puntero a array de estadísticas
- * Salidas: NULL
- * Descripción: Maneja los procesos bloqueados simulando E/S en porciones de 10ms
- */
+/* Manejador de bloqueos en porciones de 10ms */
 void* manejador_bloqueos(void* arg) {
-    Estadisticas* estadisticas = (Estadisticas*)arg;
-    
+    Estadisticas* stats = arg;
     while (__sync_fetch_and_add(&procesos_terminados, 0) < total_procesos) {
         pthread_mutex_lock(&mutex_bloqueados);
-        
-        if (bloqueados_size == 0) {
-            pthread_mutex_unlock(&mutex_bloqueados);
-            usleep(1000); // Reducir tiempo de espera
-            continue;
-        }
-        
-        // Procesar cada proceso bloqueado en porciones de 10ms
         for (int i = 0; i < bloqueados_size; i++) {
             ProcesoBloqueado* pb = &bloqueados[i];
-            
-            // Simular 10ms de E/S
+            usleep((unsigned)(10 * 1000 * scale_factor));
+            incrementar_tiempo(10);
             pb->tiempo_bloqueo_restante -= 10;
-            
-            // Si el proceso terminó su E/S
+            pthread_mutex_lock(&mutex_stats);
+            stats[pb->proceso->last_core].tiempo_bloqueo_total += 10;
+            stats[pb->proceso->last_core].bloqueos_count++;
+            pthread_mutex_unlock(&mutex_stats);
             if (pb->tiempo_bloqueo_restante <= 0) {
                 Proceso* p = pb->proceso;
                 p->esta_bloqueado = 0;
-                
-                // Calcular tiempo total de bloqueo
-                int tiempo_total_bloqueo = obtener_tiempo_actual() - pb->tiempo_inicio_bloqueo;
-                p->tiempo_total_bloqueo += tiempo_total_bloqueo;
-                
-                // Actualizar estadísticas del procesador que lo bloqueó
-                if (p->last_core >= 0) {
-                    pthread_mutex_lock(&mutex_stats);
-                    estadisticas[p->last_core].tiempo_bloqueo_total += tiempo_total_bloqueo;
-                    estadisticas[p->last_core].bloqueos_count++;
-                    pthread_mutex_unlock(&mutex_stats);
-                }
-                
-                // Devolver proceso a runqueue
+                int fin = obtener_tiempo_actual();
+                p->tiempo_total_bloqueo += fin - pb->tiempo_inicio_bloqueo;
                 pthread_mutex_lock(&mutex_runqueue);
-                p->tiempo_entrada_runqueue = obtener_tiempo_actual();
+                p->tiempo_entrada_runqueue = fin;
                 runqueue[runqueue_size++] = p;
                 pthread_mutex_unlock(&mutex_runqueue);
-                
-                printf("[IO] PID %d completó E/S, vuelve a runqueue\n", p->pid);
-                
-                // Remover de la lista de bloqueados
-                for (int j = i; j < bloqueados_size - 1; j++) {
-                    bloqueados[j] = bloqueados[j + 1];
-                }
+                printf("[IO|t=%d] PID=%d sale de I/O\n", fin, p->pid);
+                for (int j = i; j+1 < bloqueados_size; j++) bloqueados[j] = bloqueados[j+1];
                 bloqueados_size--;
-                i--; // Ajustar índice
+                i--;
             }
         }
-        
         pthread_mutex_unlock(&mutex_bloqueados);
-        
-        // Simular 10ms de tiempo real (reducido)
-        usleep(1000);
     }
-    
-    pthread_exit(NULL);
+    return NULL;
 }
 
-/**
- * Entradas: arg - no utilizado
- * Salidas: NULL
- * Descripción: Hilo reloj que ingresa procesos a la runqueue según su tiempo de llegada
- */
+/* Hilo reloj que avanza 10ms simulados */
 void* hilo_reloj(void* arg) {
+    (void)arg;
     while (__sync_fetch_and_add(&procesos_terminados, 0) < total_procesos) {
-        int tiempo_act = obtener_tiempo_actual();
-        
-        // Verificar procesos pendientes
+        int now = obtener_tiempo_actual();
         for (int i = 0; i < total_procesos; i++) {
             Proceso* p = procesos_pendientes[i];
-            if (p != NULL && p->tiempo_llegada <= tiempo_act) {
-                // Agregar proceso a runqueue
+            if (p && p->tiempo_llegada <= now) {
                 pthread_mutex_lock(&mutex_runqueue);
-                p->tiempo_entrada_runqueue = tiempo_act;
+                p->tiempo_entrada_runqueue = now;
                 runqueue[runqueue_size++] = p;
                 pthread_mutex_unlock(&mutex_runqueue);
-                
                 procesos_pendientes[i] = NULL;
-                printf("[RELOJ] PID %d ingresado a runqueue en t=%d\n", p->pid, tiempo_act);
+                printf("[RELOJ|t=%d] PID=%d en runqueue\n", now, p->pid);
             }
         }
-        
-        // Avanzar tiempo de simulación
-        usleep(10000); // Simular 10ms
+        usleep((unsigned)(10 * 1000 * scale_factor));
         incrementar_tiempo(10);
     }
-    
-    pthread_exit(NULL);
+    return NULL;
 }
